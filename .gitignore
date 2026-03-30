@@ -1,0 +1,28 @@
+# ambiente virtual
+.venv/
+venv/
+
+# env
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# banco e dados locais
+data/
+logs/
+
+# build
+build/
+dist/
+*.spec
+
+# vscode
+.vscode/
+
+# sistema
+Thumbs.db
+.DS_Store
