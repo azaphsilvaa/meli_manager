@@ -13,9 +13,16 @@ echo Ativando ambiente virtual...
 call .venv\Scripts\activate
 
 echo.
+echo Atualizando pip...
+python -m pip install --upgrade pip
+
+echo.
 echo Instalando dependencias...
-pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+
+echo.
+echo Gerando sons padrao do sistema...
+python app\scripts\generate_default_sounds.py
 
 echo.
 echo ================================

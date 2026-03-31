@@ -5,6 +5,10 @@ import webbrowser
 
 from services.meli_label_service import MercadoLivreLabelService
 from services.printer_service import PrinterService
+from services.webhook_queue_service import WebhookQueueService
+from services.processed_event_service import ProcessedEventService
+from services.retry_service import RetryService
+from services.sound_service import SoundService, UiSoundEventFilter
 from services.operation_log_service import OperationLogService
 from services.label_print_control_service import LabelPrintControlService
 from services.live_monitor_service import LiveMonitorService
@@ -30,6 +34,7 @@ from ui.splash_screen import SplashScreen
 oauth_running = False
 window_instance = None
 webhook_server = None
+webhook_queue_service = WebhookQueueService()
 
 def test_download_label():
     from services.account_service import AccountService
@@ -201,6 +206,30 @@ def test_list_real_orders():
     for order in results[:5]:
         print("ORDER_ID:", order.get("id"))
 
+def test_retry_service():
+    retry_service = RetryService()
+
+    state = {"count": 0}
+
+    def unstable_action():
+        state["count"] += 1
+
+        print(f"Executando teste de retry... contador = {state['count']}")
+
+        if state["count"] < 3:
+            raise Exception("Falha simulada no teste de retry.")
+
+        return "OK"
+
+    result = retry_service.run(
+        action=unstable_action,
+        action_name="teste interno de retry",
+        max_attempts=3,
+        delay_seconds=1,
+    )
+
+    print("Resultado final do retry:", result)
+
 
 def initialize_database():
     Base.metadata.create_all(bind=engine)
@@ -312,157 +341,274 @@ def try_download_label_for_shipment(user_id: str, shipment_id: str | None):
         if window_instance is not None:
             QTimer.singleShot(0, window_instance.refresh_dashboard_page)
 
+def get_connected_account_by_user_id(user_id: str):
+    try:
+        account_service = AccountService()
+        return account_service.get_account_by_user_id(str(user_id))
 
-def process_webhook_event(event_data: dict):
+    except Exception as error:
+        print(f"Erro ao buscar conta conectada por user_id: {error}")
+        return None
+    
+
+def process_real_order_flow(order_resource: str, user_id: str):
+    print("=====================================")
+    print("FLOW ORDER")
+    print("Resource:", order_resource)
+    print("User ID:", user_id)
+    print("=====================================")
+
+    try:
+        account = get_connected_account_by_user_id(user_id)
+
+        if not account:
+            print(f"Conta não encontrada para o user_id {user_id}.")
+            return
+
+        order_service = MercadoLivreOrderService()
+        shipment_service = ShipmentService()
+        label_service = MercadoLivreLabelService()
+        label_file_service = LabelFileService()
+        printer_service = PrinterService()
+        log_service = OperationLogService()
+
+        print("🔍 Buscando pedido no Mercado Livre...")
+
+        order = order_service.get_order(order_resource, account.access_token)
+
+        if not order:
+            print("❌ Pedido não encontrado.")
+            return
+
+        print(f"✅ Pedido encontrado: {order.get('id')}")
+
+        shipment_id = order.get("shipping", {}).get("id")
+
+        if not shipment_id:
+            print("❌ Pedido sem shipment.")
+            return
+
+        print(f"📦 Shipment ID: {shipment_id}")
+
+        shipment = shipment_service.get_shipment(shipment_id, account.access_token)
+
+        if not shipment:
+            print("❌ Shipment não encontrado.")
+            return
+
+        print("📄 Baixando etiqueta...")
+
+        label_url = label_service.get_label_url(shipment_id, account.access_token)
+
+        if not label_url:
+            print("❌ Não foi possível obter a etiqueta.")
+            return
+
+        file_path = label_file_service.download_label(label_url, shipment_id)
+
+        print(f"✅ Etiqueta salva em: {file_path}")
+
+        # 👉 Controle de impressão
+        processed_event_service = ProcessedEventService()
+        should_print = True
+
+        if should_print:
+            if processed_event_service.is_shipment_already_printed(shipment_id):
+                print(f"⚠️ Shipment {shipment_id} já foi impresso anteriormente. Ignorando reimpressão automática.")
+            else:
+                printer_name = printer_service.get_selected_printer_name()
+
+                if printer_name:
+                    print_result = printer_service.print_pdf_file(printer_name, file_path)
+
+                    if print_result:
+                        processed_event_service.mark_shipment_printed(
+                            shipment_id=shipment_id,
+                            file_path=file_path,
+                        )
+                        print("🖨️ Enviado para impressão")
+                    else:
+                        print("❌ Falha ao enviar para impressão")
+                else:
+                    print("⚠️ Nenhuma impressora selecionada para impressão automática.")
+
+        log_service.log_info(f"Pedido {order.get('id')} processado com sucesso.")
+
+    except Exception as error:
+        print(f"Erro no FLOW ORDER: {error}")
+
+
+def process_real_shipment_flow(shipment_resource: str, user_id: str):
+    print("=====================================")
+    print("FLOW SHIPMENT")
+    print("Resource:", shipment_resource)
+    print("User ID:", user_id)
+    print("=====================================")
+
+    try:
+        account = get_connected_account_by_user_id(user_id)
+
+        if not account:
+            print(f"Conta não encontrada para o user_id {user_id}.")
+            return
+
+        shipment_service = ShipmentService()
+        label_service = MercadoLivreLabelService()
+        printer_service = PrinterService()
+        log_service = OperationLogService()
+        processed_event_service = ProcessedEventService()
+
+        shipment_id = shipment_resource.split("/")[-1]
+
+        print(f"📦 Shipment ID: {shipment_id}")
+
+        shipment = shipment_service.create_or_update_from_meli_api(
+            shipment_id=shipment_id,
+            user_id=user_id,
+        )
+
+        if not shipment:
+            print("❌ Shipment não encontrado.")
+            return
+
+        print("✅ Shipment encontrado e salvo/atualizado no banco.")
+
+        print("📄 Baixando etiqueta...")
+
+        file_path = label_service.download_label(
+            access_token=account.access_token,
+            shipment_id=str(shipment_id),
+        )
+
+        if not file_path:
+            print("❌ Não foi possível salvar a etiqueta.")
+            return
+
+        print(f"✅ Etiqueta salva em: {file_path}")
+
+        should_print = True
+
+        if should_print:
+            if processed_event_service.is_shipment_already_printed(shipment_id):
+                print(
+                    f"⚠️ Shipment {shipment_id} já foi impresso anteriormente. "
+                    "Ignorando reimpressão automática."
+                )
+            else:
+                printer_name = printer_service.get_selected_printer_name()
+
+                if printer_name:
+                    print_result = printer_service.print_pdf_file(
+                        printer_name=printer_name,
+                        file_path=file_path,
+                    )
+
+                    if print_result:
+                        processed_event_service.mark_shipment_printed(
+                            shipment_id=shipment_id,
+                            file_path=file_path,
+                        )
+                        print("🖨️ Enviado para impressão")
+                    else:
+                        print("❌ Falha ao enviar para impressão")
+                else:
+                    print("⚠️ Nenhuma impressora selecionada para impressão automática.")
+
+        log_service.set_last_shipment(f"Shipment {shipment_id}")
+        log_service.set_last_label(file_path)
+        print(f"✅ Shipment {shipment_id} processado com sucesso.")
+
+    except Exception as error:
+        print(f"Erro no FLOW SHIPMENT: {error}")
+
+        log_service = OperationLogService()
+        log_service.set_last_error(f"FLOW SHIPMENT: {error}")
+        
+
+def process_webhook_event(event):
     global window_instance
 
     try:
-        monitor_service = LiveMonitorService()
-
-        if not monitor_service.get_status():
-            print("Monitoramento OFF -> webhook recebido, mas automação bloqueada.")
-            return
-
-        body = event_data.get("body", {}) or {}
+        body = event.get("body", {}) or {}
 
         topic = body.get("topic") or body.get("type") or ""
         resource = body.get("resource", "") or ""
-        user_id = str(body.get("user_id"))
+        user_id = str(body.get("user_id") or "").strip()
+
+        print("========== WEBHOOK ==========")
+        print("Topic:", topic)
+        print("Resource:", resource)
+        print("User ID:", user_id)
+        print("=============================")
+
+        allowed_topics = {
+            "orders_v2",
+            "shipments",
+        }
+
+        if topic not in allowed_topics:
+            print(f"Webhook ignorado. Tópico não permitido: {topic}")
+            return
+
+        if not user_id:
+            print("Webhook ignorado. user_id ausente.")
+            return
+
+        account = get_connected_account_by_user_id(user_id)
+
+        if not account:
+            print(f"Webhook ignorado. user_id não conectado no sistema: {user_id}")
+            return
+
+        print(f"Conta válida encontrada para user_id {user_id}.")
         
+        processed_event_service = ProcessedEventService()
+        processed_event_service.clear_old_events()
+
+        if processed_event_service.is_event_processed(topic, resource, user_id):
+            print("Webhook ignorado. Evento já foi processado anteriormente.")
+            return
+
+        if topic == "orders_v2":
+            print(f"Processando orders_v2 para user_id {user_id}: {resource}")
+
+            process_real_order_flow(
+                order_resource=resource,
+                user_id=user_id,
+            )
+
+        elif topic == "shipments":
+            print(f"Processando shipments para user_id {user_id}: {resource}")
+
+            process_real_shipment_flow(
+                shipment_resource=resource,
+                user_id=user_id,
+            )
+
+        processed_event_service.mark_event_processed(topic, resource, user_id)
+
+        if window_instance is not None:
+            QTimer.singleShot(0, window_instance.refresh_dashboard_page)
+            QTimer.singleShot(0, window_instance.refresh_sales_page)
+            QTimer.singleShot(0, window_instance.refresh_labels_page)
+
+    except Exception as error:
+        print(f"Erro ao processar webhook: {error}")
+
         log_service = OperationLogService()
-        log_service.set_last_notification(topic, resource, user_id)
+        log_service.set_last_error(f"Webhook: {error}")
 
         if window_instance is not None:
             QTimer.singleShot(0, window_instance.refresh_dashboard_page)
 
-        if not topic:
-            print("Webhook sem tópico identificado.")
-            return
+def enqueue_webhook_event(event):
+    global webhook_queue_service
 
-        if topic == "orders_v2" or "orders/" in resource:
-            order_id = resource.split("/")[-1]
-
-            print(f"Buscando pedido real: {order_id}")
-
-            order_service = OrderService()
-            order = order_service.create_or_update_from_meli_api(order_id, user_id)
-
-            if not order:
-                print("Falha ao salvar pedido real.")
-                return
-
-            print("Pedido REAL salvo:")
-            print("ORDER_ID:", order.ml_order_id)
-            print("ITEM:", order.item_title)
-            
-            log_service.set_last_order(order.ml_order_id, order.item_title)
-
-            if window_instance is not None:
-                QTimer.singleShot(0, window_instance.refresh_dashboard_page)
-
-            if order.ml_shipment_id:
-                shipment_service = ShipmentService()
-
-                shipment = shipment_service.create_or_update_from_meli_api(
-                    shipment_id=order.ml_shipment_id,
-                    user_id=user_id,
-                    ml_order_id=order.ml_order_id,
-                )
-
-                if shipment:
-                    print("SHIPMENT REAL salvo:")
-                    print("SHIPMENT_ID:", shipment.ml_shipment_id)
-                    print("STATUS:", shipment.shipping_status)
-                    print("SUBSTATUS:", shipment.shipping_substatus)
-                    
-                    log_service.set_last_shipment(
-                        shipment.ml_shipment_id,
-                        shipment.shipping_status,
-                        shipment.shipping_substatus,
-                    )
-
-                    if window_instance is not None:
-                        QTimer.singleShot(0, window_instance.refresh_dashboard_page)
-
-                    if shipment.shipping_status == "ready_to_ship":
-                        print("Shipment pronto para etiqueta.")
-                        try_download_label_for_shipment(
-                            user_id=user_id,
-                            shipment_id=shipment.ml_shipment_id,
-                        )
-                    else:
-                        print(
-                            "Shipment não está pronto para etiqueta:",
-                            shipment.shipping_status,
-                        )
-                else:
-                    print("Pedido salvo, mas shipment não pôde ser carregado.")
-            else:
-                print("Pedido salvo sem shipment_id.")
-
-            if window_instance is not None:
-                QTimer.singleShot(0, window_instance.refresh_sales_page)
-
-            return
-
-        if topic == "shipments" or "shipments/" in resource:
-            shipment_id = resource.split("/")[-1]
-
-            print(f"Buscando shipment real: {shipment_id}")
-
-            shipment_service = ShipmentService()
-            shipment = shipment_service.create_or_update_from_meli_api(
-                shipment_id=shipment_id,
-                user_id=user_id,
-                ml_order_id=None,
-            )
-
-            if not shipment:
-                print("Falha ao salvar shipment real.")
-                return
-
-            print("SHIPMENT REAL salvo via webhook:")
-            print("SHIPMENT_ID:", shipment.ml_shipment_id)
-            print("STATUS:", shipment.shipping_status)
-            print("SUBSTATUS:", shipment.shipping_substatus)
-
-            if shipment.ml_order_id:
-                print("Shipment vinculado ao ORDER_ID:", shipment.ml_order_id)
-
-                order_service = OrderService()
-                order = order_service.create_or_update_from_meli_api(
-                    shipment.ml_order_id,
-                    user_id,
-                )
-
-                if order:
-                    print("Pedido relacionado atualizado pelo shipment.")
-                    print("ORDER_ID:", order.ml_order_id)
-                    print("ITEM:", order.item_title)
-
-                    if window_instance is not None:
-                        QTimer.singleShot(0, window_instance.refresh_sales_page)
-
-            if shipment.shipping_status == "ready_to_ship":
-                print("Shipment pronto para etiqueta.")
-                try_download_label_for_shipment(
-                    user_id=user_id,
-                    shipment_id=shipment.ml_shipment_id,
-                )
-            else:
-                print(
-                    "Shipment não está pronto para etiqueta:",
-                    shipment.shipping_status,
-                )
-
-            return
-
-        print("Webhook recebido, mas sem tratamento para esse tópico ainda.")
-        print("TOPIC:", topic)
-        print("RESOURCE:", resource)
+    try:
+        webhook_queue_service.enqueue(event)
 
     except Exception as error:
-        print(f"Erro ao processar webhook: {error}")
+        print(f"Erro ao enfileirar webhook: {error}")
 
 
 def start_webhook_server():
@@ -472,7 +618,7 @@ def start_webhook_server():
         return
 
     webhook_server = AppWebhookServer(host="127.0.0.1", port=8765)
-    webhook_server.start(webhook_callback=process_webhook_event)
+    webhook_server.start(webhook_callback=lambda event: enqueue_webhook_event(event))
 
 
 def run_oauth_flow():
@@ -973,9 +1119,16 @@ def main():
     global window_instance
 
     initialize_database()
+    webhook_queue_service.start(process_webhook_event)
     start_webhook_server()
 
     app = QApplication(sys.argv)
+    
+    sound_service = SoundService()
+    ui_sound_filter = UiSoundEventFilter(sound_service)
+
+    app.installEventFilter(ui_sound_filter)
+    sound_service.start_loading_loop()
 
     splash = SplashScreen()
     splash.show()
@@ -998,6 +1151,8 @@ def main():
     window.printers_page.select_printer_requested.connect(start_select_printer_in_background)
 
     def open_main_window():
+        sound_service.stop_loading_loop()
+        sound_service.play_success()
         splash.close()
         window.show()
 
